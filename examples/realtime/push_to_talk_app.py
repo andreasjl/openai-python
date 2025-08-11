@@ -1,12 +1,19 @@
 #!/usr/bin/env uv run
 ####################################################################
 # Sample TUI app with a push to talk interface to the Realtime API #
-# If you have `uv` installed and the `OPENAI_API_KEY`              #
+# If you have `uv` installed and the `AZURE_OPENAI_ENDPOINT` set   #
+# to your AOAI endpoint from Azure Portal                          #
+# (e.g., https://YOUR_ACCOUNT.openai.azure.com/), and the          #
+# `AZURE_OPENAI_DEPLOYMENT` set to your deployment name from       #
+# AI Foundry.                                                      #
+# The application uses Entra ID authentication with                #
+# DefaultAzureCredentials. Make sure to have at least the          #
+# "Cognitive Services OpenAI User" role assigned to your account.  #
 # environment variable set, you can run this example with just     #
 #                                                                  #
 # `./examples/realtime/push_to_talk_app.py`                        #
 #                                                                  #
-# On Mac, you'll also need `brew install portaudio ffmpeg`           #
+# On Mac, you'll also need `brew install portaudio ffmpeg`         #
 ####################################################################
 #
 # /// script
@@ -18,6 +25,9 @@
 #     "pydub",
 #     "sounddevice",
 #     "openai[realtime]",
+#     "openai",
+#     "azure-identity",
+#     "aiohttp"
 # ]
 #
 # [tool.uv.sources]
@@ -37,7 +47,11 @@ from textual.widgets import Button, Static, RichLog
 from textual.reactive import reactive
 from textual.containers import Container
 
-from openai import AsyncOpenAI
+import os
+
+from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+
+from openai import AsyncAzureOpenAI
 from openai.types.beta.realtime.session import Session
 from openai.resources.beta.realtime.realtime import AsyncRealtimeConnection
 
@@ -123,7 +137,7 @@ class RealtimeApp(App[None]):
         }
     """
 
-    client: AsyncOpenAI
+    client: AsyncAzureOpenAI
     should_send_audio: asyncio.Event
     audio_player: AudioPlayerAsync
     last_audio_item_id: str | None
@@ -135,7 +149,13 @@ class RealtimeApp(App[None]):
         super().__init__()
         self.connection = None
         self.session = None
-        self.client = AsyncOpenAI()
+
+        self.client = AsyncAzureOpenAI(
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            azure_ad_token_provider=get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"),
+            api_version="2025-04-01-preview",
+        )
+
         self.audio_player = AudioPlayerAsync()
         self.last_audio_item_id = None
         self.should_send_audio = asyncio.Event()
@@ -154,17 +174,17 @@ class RealtimeApp(App[None]):
         self.run_worker(self.send_mic_audio())
 
     async def handle_realtime_connection(self) -> None:
-        async with self.client.beta.realtime.connect(model="gpt-4o-realtime-preview") as conn:
+        async with self.client.beta.realtime.connect(model=os.environ["AZURE_OPENAI_DEPLOYMENT"]) as conn:
             self.connection = conn
             self.connected.set()
 
             # note: this is the default and can be omitted
             # if you want to manually handle VAD yourself, then set `'turn_detection': None`
-            await conn.session.update(session={"turn_detection": {"type": "server_vad"}})
-
-            acc_items: dict[str, Any] = {}
+            await conn.session.update(session={"instructions": "You are a helpful assistant and always respond with audio. Use the language of the user.", "turn_detection": {"type": "server_vad"}})
 
             async for event in conn:
+                bottom_pane = self.query_one("#bottom-pane", RichLog)
+                bottom_pane.write(event.type)
                 if event.type == "session.created":
                     self.session = event.session
                     session_display = self.query_one(SessionDisplay)
@@ -178,6 +198,7 @@ class RealtimeApp(App[None]):
 
                 if event.type == "response.audio.delta":
                     if event.item_id != self.last_audio_item_id:
+                        self.audio_player.stop()
                         self.audio_player.reset_frame_count()
                         self.last_audio_item_id = event.item_id
 
@@ -185,19 +206,6 @@ class RealtimeApp(App[None]):
                     self.audio_player.add_data(bytes_data)
                     continue
 
-                if event.type == "response.audio_transcript.delta":
-                    try:
-                        text = acc_items[event.item_id]
-                    except KeyError:
-                        acc_items[event.item_id] = event.delta
-                    else:
-                        acc_items[event.item_id] = text + event.delta
-
-                    # Clear and update the entire content because RichLog otherwise treats each delta as a new line
-                    bottom_pane = self.query_one("#bottom-pane", RichLog)
-                    bottom_pane.clear()
-                    bottom_pane.write(acc_items[event.item_id])
-                    continue
 
     async def _get_connection(self) -> AsyncRealtimeConnection:
         await self.connected.wait()
@@ -278,6 +286,15 @@ class RealtimeApp(App[None]):
                 status_indicator.is_recording = True
 
 
+def handle_exception(exc_type, exc_value, exc_traceback):
+    print("An unhandled exception occurred:", exc_value)
+    print("Exception type:", exc_type)
+    print("Traceback:", exc_traceback)
+
 if __name__ == "__main__":
+    import sys
+
+    # Set the exception handler to catch unhandled exceptions
+    sys.excepthook = handle_exception
     app = RealtimeApp()
     app.run()
