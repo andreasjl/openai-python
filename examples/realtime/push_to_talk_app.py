@@ -51,10 +51,9 @@ import os
 
 from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.beta.realtime.session import Session
 from openai.resources.beta.realtime.realtime import AsyncRealtimeConnection
-
 
 class SessionDisplay(Static):
     """A widget that shows the current session ID."""
@@ -137,7 +136,7 @@ class RealtimeApp(App[None]):
         }
     """
 
-    client: AsyncAzureOpenAI
+    client: AsyncOpenAI #AsyncAzureOpenAI
     should_send_audio: asyncio.Event
     audio_player: AudioPlayerAsync
     last_audio_item_id: str | None
@@ -150,10 +149,13 @@ class RealtimeApp(App[None]):
         self.connection = None
         self.session = None
 
-        self.client = AsyncAzureOpenAI(
-            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-            azure_ad_token_provider=get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"),
-            api_version="2025-04-01-preview",
+        # self.client = AsyncAzureOpenAI(
+        #     azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        #     azure_ad_token_provider=get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"),
+        #     api_version="2024-10-01-preview"
+        # )
+        self.client = AsyncOpenAI(
+            api_key="TODO"
         )
 
         self.audio_player = AudioPlayerAsync()
@@ -174,13 +176,20 @@ class RealtimeApp(App[None]):
         self.run_worker(self.send_mic_audio())
 
     async def handle_realtime_connection(self) -> None:
-        async with self.client.beta.realtime.connect(model=os.environ["AZURE_OPENAI_DEPLOYMENT"]) as conn:
+        async with self.client.beta.realtime.connect(
+            # model=os.environ["AZURE_OPENAI_DEPLOYMENT"],
+            model = "gpt-realtime-2026-01-12"
+            # extra_headers={
+            #     "x-ms-oai-assistants-testenv": "dev.hyena",
+            #     "x-ms-oai-assistants-testdep": "pull-63993",
+            # },
+        ) as conn:
             self.connection = conn
             self.connected.set()
 
             # note: this is the default and can be omitted
             # if you want to manually handle VAD yourself, then set `'turn_detection': None`
-            await conn.session.update(session={"instructions": "You are a helpful assistant and always respond with audio. Use the language of the user.", "turn_detection": {"type": "server_vad"}})
+            await conn.session.update(session={"modalities": ["audio", "text"], "voice": "cedar", "instructions": "You are a helpful AI assistant. Respond naturally and conversationally.", "turn_detection": {"type": "server_vad"}, "input_audio_transcription": { "model": "gpt-4o-transcribe"}})
 
             async for event in conn:
                 bottom_pane = self.query_one("#bottom-pane", RichLog)
@@ -194,7 +203,19 @@ class RealtimeApp(App[None]):
 
                 if event.type == "session.updated":
                     self.session = event.session
+                    bottom_pane.write(f"Session updated: {event}")
                     continue
+
+                if event.type == "error":
+                    bottom_pane.write(f"Error: {event}")
+                    continue
+                if event.type == "response.done" or event.type == "response.output_item.done":
+                    bottom_pane.write(f"{event.type}: {event}")
+                    continue
+                if event.type == "conversation.item.created":
+                    bottom_pane.write(f"Conversation item created: {event}")
+                    continue
+
 
                 if event.type == "response.audio.delta":
                     if event.item_id != self.last_audio_item_id:
@@ -204,6 +225,10 @@ class RealtimeApp(App[None]):
 
                     bytes_data = base64.b64decode(event.delta)
                     self.audio_player.add_data(bytes_data)
+                    continue
+
+                if event.type == "conversation.item.input_audio_transcription.completed":
+                    bottom_pane.write(f"[bold green]Transcription:[/bold green] {event}")
                     continue
 
 
